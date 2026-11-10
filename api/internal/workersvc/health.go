@@ -1380,18 +1380,37 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		projection = &healthEligibilityResult{counts: counts, err: err}
 	}
 	eligibility, eligibilityErr := projection.counts, projection.err
+	// Issue #4044: evaluated at most once per call, lazily.
+	var (
+		gapWorker store.Worker
+		gapOK     bool
+		gapDone   bool
+	)
+	gap := func() (store.Worker, bool) {
+		if !gapDone {
+			gapDone = true
+			gapWorker, gapOK = s.assignedRepoAgentSourceGap(ctx, r)
+		}
+		return gapWorker, gapOK
+	}
+	holdReason := func(until time.Time) string {
+		if wkr, ok := gap(); ok {
+			return assignedRepoAgentSourceGapHeldReason(until, wkr.Name)
+		}
+		return ownerHoldReason(until, r.StaleRequeueWorkerName)
+	}
 	until, held := s.ownerHold(now, r)
 	preserveManual := eligibilityErr != nil && r.HealthReason.Valid && isManualCordonWaitReason(r.HealthReason.String)
 	if eligibilityErr == nil {
 		if reason := manualCordonWaitReason(eligibility); reason != "" {
 			if held && eligibility.AutomaticOwnerHold {
-				reason += "; " + ownerHoldReason(until, r.StaleRequeueWorkerName)
+				reason += "; " + holdReason(until)
 			}
 			return reason
 		}
 	}
 	if held && !preserveManual && (eligibilityErr != nil || (eligibility.AssignedClaimable == 0 && (eligibility.ManualCordoned == 0 || eligibility.AutomaticOwnerHold))) {
-		return ownerHoldReason(until, r.StaleRequeueWorkerName)
+		return holdReason(until)
 	}
 	if until, pinned := s.staleRequeuePin(now, r); pinned {
 		return staleRequeuePinReason(until, r.StaleRequeueWorkerName)
@@ -1702,11 +1721,14 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 	// (fn_run_priority_class), so the reason and the claim order can never disagree.
 	// Only aged runs and the gated early Docker probe reach this lookup. Normal/expedited
 	// results and read errors fall through to the generic reasons below.
-	switch s.queuedPriorityClass(ctx, now, r) {
-	case "background":
-		return reasonDeprioritized
-	case "restored":
-		return reasonRestored
+	// The #4044 capability gap outranks the priority re-label.
+	if _, ok := gap(); !ok {
+		switch s.queuedPriorityClass(ctx, now, r) {
+		case "background":
+			return reasonDeprioritized
+		case "restored":
+			return reasonRestored
+		}
 	}
 	// PRD #361 (issue #512 M2): a repo-bearing queued run that NO online worker is ELIGIBLE
 	// to claim. CountOnlineEligibleWorkersForRepo threads the docker allowlist fence AND the
@@ -1787,6 +1809,22 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 				return fmt.Sprintf("waiting for another worker, or restart worker %s (its previous process was released at the time limit)", wkr.Name)
 			}
 		}
+	}
+	// Issue #4044: the assigned worker lacks repo_agent_source_v1, so ClaimRun refuses it
+	// and "all workers busy" is wrong. Stays in the pin lifecycle while the owner row is
+	// live and the hold window is open; otherwise a post-hold reason.
+	if wkr, ok := gap(); ok {
+		if r.StaleRequeueWorkerName != "" && r.UpdatedAt.Valid &&
+			wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
+			if ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling); !now.After(ceilingEnd) {
+				return assignedRepoAgentSourceGapHeldReason(ceilingEnd, wkr.Name)
+			}
+		}
+		tail := "waiting for another worker to pick it up"
+		if eligibilityErr == nil && eligibility.Claimable == 0 {
+			tail = "no other worker can claim it right now"
+		}
+		return assignedRepoAgentSourceGapReason(wkr.Name, tail)
 	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
@@ -2142,6 +2180,55 @@ func (s *Service) ownerHold(now time.Time, r store.ListActiveRunsForHealthRow) (
 	return until, !now.After(until)
 }
 
+const (
+	repoAgentSourceGapFragment = "currently lacks the required protocol capability repo_agent_source_v1"
+	repoAgentSourceGapResume   = ", so it can resume this run only after re-registering with it"
+	assignedWorkerPrefix       = "its assigned worker "
+)
+
+// assignedRepoAgentSourceGap reports whether the run's assigned worker (runs.worker_id) is
+// owned by the run's user and lacks repo_agent_source_v1 while the run requires it (issue
+// #4044). ClaimRun refuses that worker, so the owner-hold and all-workers-busy texts would
+// mislead. Any read error, missing row or owner mismatch fails open (false) so no name from
+// a foreign row is ever rendered. Health-text only; claim and fences are unchanged.
+func (s *Service) assignedRepoAgentSourceGap(ctx context.Context, r store.ListActiveRunsForHealthRow) (store.Worker, bool) {
+	if !r.WorkerID.Valid || !(r.RepoAgentSourceRequired || r.RepoAgentSourceCommit.Valid) {
+		return store.Worker{}, false
+	}
+	id := uuid.UUID(r.WorkerID.Bytes)
+	wkr, err := s.q.GetWorkerByIDForUser(ctx, store.GetWorkerByIDForUserParams{ID: id, UserID: r.UserID})
+	if err != nil || wkr.ID != id || wkr.UserID != r.UserID {
+		return store.Worker{}, false
+	}
+	if slices.Contains(wkr.ProtocolCapabilities, capability.RepoAgentSourceV1) {
+		return store.Worker{}, false
+	}
+	return wkr, true
+}
+
+// assignedRepoAgentSourceGapHeldReason keeps the owner-hold lifecycle ("waiting until ...")
+// while naming the capability gap.
+func assignedRepoAgentSourceGapHeldReason(until time.Time, workerName string) string {
+	who := "its previous worker"
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who + ": it " +
+		repoAgentSourceGapFragment + repoAgentSourceGapResume + "; another worker may take it after that"
+}
+
+func assignedRepoAgentSourceGapReason(workerName, tail string) string {
+	who := strings.TrimSuffix(assignedWorkerPrefix, " ")
+	if workerName != "" {
+		who += " " + workerName
+	}
+	return who + " " + repoAgentSourceGapFragment + repoAgentSourceGapResume + "; " + tail
+}
+
+func isAssignedCapabilityGapReason(reason string) bool {
+	return strings.HasPrefix(reason, assignedWorkerPrefix) && strings.Contains(reason, repoAgentSourceGapFragment)
+}
+
 func ownerHoldReason(until time.Time, workerName string) string {
 	who := "its previous worker"
 	if workerName != "" {
@@ -2193,6 +2280,7 @@ func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
 		strings.Contains(reason, " for its previous worker") &&
 		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
+			strings.HasSuffix(reason, repoAgentSourceGapResume+"; another worker may take it after that") ||
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
 }
 
