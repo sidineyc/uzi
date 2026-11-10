@@ -2183,7 +2183,7 @@ func (s *Service) ownerHold(now time.Time, r store.ListActiveRunsForHealthRow) (
 const (
 	repoAgentSourceGapFragment = "currently lacks the required protocol capability repo_agent_source_v1"
 	repoAgentSourceGapResume   = ", so it can resume this run only after re-registering with it"
-	assignedWorkerPrefix       = "its assigned worker "
+	assignedWorkerPrefix       = "its assigned worker"
 )
 
 // assignedRepoAgentSourceGap reports whether the run's assigned worker (runs.worker_id) is
@@ -2218,15 +2218,11 @@ func assignedRepoAgentSourceGapHeldReason(until time.Time, workerName string) st
 }
 
 func assignedRepoAgentSourceGapReason(workerName, tail string) string {
-	who := strings.TrimSuffix(assignedWorkerPrefix, " ")
+	who := assignedWorkerPrefix
 	if workerName != "" {
 		who += " " + workerName
 	}
 	return who + " " + repoAgentSourceGapFragment + repoAgentSourceGapResume + "; " + tail
-}
-
-func isAssignedCapabilityGapReason(reason string) bool {
-	return strings.HasPrefix(reason, assignedWorkerPrefix) && strings.Contains(reason, repoAgentSourceGapFragment)
 }
 
 func ownerHoldReason(until time.Time, workerName string) string {

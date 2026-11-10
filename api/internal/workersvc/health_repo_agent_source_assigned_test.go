@@ -27,6 +27,10 @@ const (
 	gapTailPickup  = "waiting for another worker to pick it up"
 )
 
+func isAssignedCapabilityGapReason(reason string) bool {
+	return strings.HasPrefix(reason, assignedWorkerPrefix+" ") && strings.Contains(reason, repoAgentSourceGapFragment)
+}
+
 type assignedGapStore struct {
 	*healthFakeStore
 	capable   int64
@@ -157,6 +161,18 @@ func TestHealthAssignedRepoAgentSourceGapHeldVariants(t *testing.T) {
 		got := assignedGapReason(t, gs, svc, r)
 		want := "waiting until 2026-07-12T13:30:00Z for its previous worker w-old" + heldSuffix
 		if got != want || !isStaleRequeuePinReason(got) {
+			t.Fatalf("reason = %q, want %q", got, want)
+		}
+	})
+	// ClaimRun's ceiling is inclusive (updated_at >= @affinity_cutoff): exactly at it, still held.
+	t.Run("live owner at the ceiling", func(t *testing.T) {
+		r := assignedGapRun()
+		r.StaleRequeueWorkerName = "w-old"
+		r.UpdatedAt = ago(2 * time.Hour)
+		gs, svc, _ := assignedGapSetup(r)
+		got := assignedGapReason(t, gs, svc, r)
+		want := "waiting until 2026-07-12T12:00:00Z for its previous worker w-old" + heldSuffix
+		if got != want {
 			t.Fatalf("reason = %q, want %q", got, want)
 		}
 	})
