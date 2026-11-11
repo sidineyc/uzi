@@ -11520,6 +11520,35 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities);
 
+-- name: GetRepoAgentSourcePeerAvailability :one
+-- Issue #4044. DISPLAY ONLY: the queued-run health reason uses these three counts to word
+-- why an owner's OTHER workers (w.id <> @exclude_worker_id, the run's assigned worker that
+-- lacks repo_agent_source_v1) cannot pick the run up. ClaimRun never reads this query and
+-- no claim, fence or ordering decision may depend on it.
+-- The pool is the owner's regular workers: online, recently heartbeating, non-ephemeral,
+-- not an isolated lane, advertising repo_agent_source_v1.
+--   capable_online          the pool
+--   capable_accepting       pool members that accept new intake (not draining/cordoned/maintenance)
+--   capable_accepting_free  accepting members with a free run-lane slot, using the SAME
+--                           active-run definition as CountOnlineWorkersWithFreeSlotForUser
+SELECT
+  count(*)::bigint AS capable_online,
+  (count(*) FILTER (WHERE fn_worker_accepts_new_intake(w)))::bigint AS capable_accepting,
+  (count(*) FILTER (WHERE fn_worker_accepts_new_intake(w)
+    AND (w.max_concurrent_runs IS NULL
+         OR (SELECT count(*) FROM runs r
+              WHERE r.worker_id = w.id
+                AND r.status IN ('claimed', 'running', 'awaiting_approval', 'awaiting_input', 'awaiting_followup')
+                AND r.kind <> 'chat' AND NOT r.cross_check_lane) < w.max_concurrent_runs)))::bigint AS capable_accepting_free
+FROM workers w
+WHERE w.user_id = @user_id
+  AND w.id <> @exclude_worker_id
+  AND w.status = 'online'
+  AND w.last_heartbeat_at >= @heartbeat_cutoff
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'repo_agent_source_v1' = ANY(w.protocol_capabilities);
+
 -- name: CountOnlineWorkersSatisfyingAgentSourceRequest :one
 SELECT count(*) FROM workers w
 WHERE w.user_id = @user_id

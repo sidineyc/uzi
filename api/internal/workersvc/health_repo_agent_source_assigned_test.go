@@ -23,8 +23,22 @@ const (
 	gapFragmentText = "currently lacks the required protocol capability repo_agent_source_v1"
 	gapPostHold     = "its assigned worker w-old " + gapFragmentText +
 		", so it can resume this run only after re-registering with it; "
-	gapTailNoClaim = "no other worker can claim it right now"
-	gapTailPickup  = "waiting for another worker to pick it up"
+	gapTailFree   = "a regular capable worker has a free slot; waiting for it to pick this run up"
+	gapTailBusy   = "your regular capable workers are busy; waiting for a free slot"
+	gapTailNotAcc = "a regular online worker reports it but is not accepting new runs (draining, cordoned or in maintenance)"
+	gapTailNone   = "none of your regular online workers reports repo_agent_source_v1"
+	gapTailPickup = "waiting for another worker to pick it up"
+	gapHeldOther  = "another worker may take it after that"
+	gapHeldPrefix = ": it " + gapFragmentText + ", so it can resume this run only after re-registering with it; "
+)
+
+type peerRow = store.GetRepoAgentSourcePeerAvailabilityRow
+
+var (
+	peersFree   = peerRow{CapableOnline: 1, CapableAccepting: 1, CapableAcceptingFree: 1}
+	peersBusy   = peerRow{CapableOnline: 1, CapableAccepting: 1}
+	peersNotAcc = peerRow{CapableOnline: 1}
+	peersNone   = peerRow{}
 )
 
 func isAssignedCapabilityGapReason(reason string) bool {
@@ -37,6 +51,14 @@ type assignedGapStore struct {
 	worker    store.Worker
 	workerErr error
 	getCalls  []store.GetWorkerByIDForUserParams
+	peers     peerRow
+	peersErr  error
+	peerCalls []store.GetRepoAgentSourcePeerAvailabilityParams
+}
+
+func (f *assignedGapStore) GetRepoAgentSourcePeerAvailability(_ context.Context, arg store.GetRepoAgentSourcePeerAvailabilityParams) (peerRow, error) {
+	f.peerCalls = append(f.peerCalls, arg)
+	return f.peers, f.peersErr
 }
 
 func (f *assignedGapStore) CountOnlineWorkersSatisfyingRepoAgentSource(context.Context, uuid.UUID) (int64, error) {
@@ -67,6 +89,7 @@ func assignedGapSetup(r store.ListActiveRunsForHealthRow) (*assignedGapStore, *S
 			freeSlotWorkers: 0,
 		},
 		capable: 1,
+		peers:   peersBusy,
 		worker: store.Worker{
 			ID:              uuid.UUID(r.WorkerID.Bytes),
 			UserID:          r.UserID,
@@ -92,7 +115,7 @@ func TestHealthAssignedRepoAgentSourceGapObservedShape(t *testing.T) {
 	r := assignedGapRun()
 	gs, svc, _ := assignedGapSetup(r)
 	got := assignedGapReason(t, gs, svc, r)
-	want := gapPostHold + gapTailNoClaim
+	want := gapPostHold + gapTailBusy
 	if got != want {
 		t.Fatalf("reason = %q, want %q", got, want)
 	}
@@ -102,6 +125,9 @@ func TestHealthAssignedRepoAgentSourceGapObservedShape(t *testing.T) {
 	if len(gs.getCalls) != 1 || gs.getCalls[0].ID != uuid.UUID(r.WorkerID.Bytes) || gs.getCalls[0].UserID != r.UserID {
 		t.Fatalf("owner-scoped lookup params = %+v", gs.getCalls)
 	}
+	if len(gs.peerCalls) != 1 || gs.peerCalls[0].UserID != r.UserID || gs.peerCalls[0].ExcludeWorkerID != uuid.UUID(r.WorkerID.Bytes) {
+		t.Fatalf("peer availability read = %+v, want exactly one scoped to the owner excluding the assigned worker", gs.peerCalls)
+	}
 }
 
 func TestHealthAssignedRepoAgentSourceGapPostHoldTails(t *testing.T) {
@@ -110,8 +136,12 @@ func TestHealthAssignedRepoAgentSourceGapPostHoldTails(t *testing.T) {
 		set  func(*assignedGapStore)
 		tail string
 	}{
-		{"claimable elsewhere", func(g *assignedGapStore) { g.eligibility.Claimable = 1 }, gapTailPickup},
-		{"eligibility error", func(g *assignedGapStore) { g.eligibilityErr = errors.New("boom") }, gapTailPickup},
+		{"free slot", func(g *assignedGapStore) { g.peers = peersFree }, gapTailFree},
+		{"busy", func(g *assignedGapStore) { g.peers = peersBusy }, gapTailBusy},
+		{"not accepting", func(g *assignedGapStore) { g.peers = peersNotAcc }, gapTailNotAcc},
+		{"none", func(g *assignedGapStore) { g.peers = peersNone }, gapTailNone},
+		{"read error", func(g *assignedGapStore) { g.peersErr = errors.New("boom") }, gapTailPickup},
+		{"eligibility error ignored", func(g *assignedGapStore) { g.eligibilityErr = errors.New("boom") }, gapTailBusy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := assignedGapRun()
@@ -125,8 +155,7 @@ func TestHealthAssignedRepoAgentSourceGapPostHoldTails(t *testing.T) {
 }
 
 func TestHealthAssignedRepoAgentSourceGapHeldVariants(t *testing.T) {
-	const heldSuffix = ": it " + gapFragmentText +
-		", so it can resume this run only after re-registering with it; another worker may take it after that"
+	const heldSuffix = gapHeldPrefix + gapHeldOther
 	t.Run("owner hold", func(t *testing.T) {
 		r := assignedGapRun()
 		r.OwnerHoldPinnable = true
@@ -208,7 +237,7 @@ func TestHealthAssignedRepoAgentSourceGapBeatsPriorityRelabel(t *testing.T) {
 	r := assignedGapRun()
 	gs, svc, _ := assignedGapSetup(r)
 	gs.priorityClass = map[uuid.UUID]string{r.ID: "background"}
-	if got := assignedGapReason(t, gs, svc, r); got != gapPostHold+gapTailNoClaim {
+	if got := assignedGapReason(t, gs, svc, r); got != gapPostHold+gapTailBusy {
 		t.Fatalf("reason = %q, want the gap reason over deprioritized", got)
 	}
 	// Control: with no gap the same run is labelled deprioritized.
@@ -365,5 +394,115 @@ func TestHealthAssignedRepoAgentSourceLeavingHoldRestampsAndNudges(t *testing.T)
 	}
 	if !w.HealthNotifiedAt.Valid || len(b.healthNudges) != 1 || !b.healthNudges[0] {
 		t.Fatalf("leaving the hold did not nudge: stamp=%v nudges=%v", w.HealthNotifiedAt, b.healthNudges)
+	}
+}
+
+func TestHealthAssignedRepoAgentSourceHeldSuffixVariants(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		peers  peerRow
+		err    error
+		suffix string
+	}{
+		{"accepting", peersBusy, nil, gapHeldOther},
+		{"free", peersFree, nil, gapHeldOther},
+		{"not accepting", peersNotAcc, nil, gapTailNotAcc},
+		{"none", peersNone, nil, gapTailNone},
+		{"read error", peerRow{}, errors.New("boom"), gapHeldOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := assignedGapRun()
+			r.OwnerHoldPinnable = true
+			r.StaleRequeueWorkerName = "w-old"
+			r.UpdatedAt = ago(30 * time.Minute)
+			gs, svc, _ := assignedGapSetup(r)
+			svc.p.WorkerAffinityCeiling = time.Hour
+			gs.peers, gs.peersErr = tc.peers, tc.err
+			got := assignedGapReason(t, gs, svc, r)
+			want := "waiting until 2026-07-12T12:30:00Z for its previous worker w-old" + gapHeldPrefix + tc.suffix
+			if got != want || !isStaleRequeuePinReason(got) {
+				t.Fatalf("reason = %q, want %q", got, want)
+			}
+			if len(gs.peerCalls) != 1 {
+				t.Fatalf("peer availability read %d times, want once", len(gs.peerCalls))
+			}
+		})
+	}
+}
+
+func TestIsStaleRequeuePinReasonRepoAgentSourceSuffixes(t *testing.T) {
+	for _, name := range []string{" w-old", ""} {
+		for _, suffix := range []string{gapHeldOther, gapTailNotAcc, gapTailNone} {
+			reason := "waiting until 2026-07-12T12:30:00Z for its previous worker" + name + gapHeldPrefix + suffix
+			if !isStaleRequeuePinReason(reason) {
+				t.Errorf("isStaleRequeuePinReason(%q) = false", reason)
+			}
+		}
+	}
+	if isStaleRequeuePinReason("waiting until 2026-07-12T12:30:00Z for code cross-check") {
+		t.Error("code cross-check wait must not be a stale-requeue pin reason")
+	}
+	if isStaleRequeuePinReason("waiting until 2026-07-12T12:30:00Z for its previous worker w-old" + gapHeldPrefix + "something else") {
+		t.Error("unknown suffix accepted")
+	}
+}
+
+func TestHealthAssignedRepoAgentSourceFleetRungNamesAssignedWorker(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		peers peerRow
+		err   error
+		want  string
+	}{
+		{"none", peersNone, nil, gapPostHold + gapTailNone},
+		{"not accepting", peersNotAcc, nil, gapPostHold + gapTailNotAcc},
+		{"read error keeps generic", peerRow{}, errors.New("boom"), reasonNoRepoAgentSourceCapableWorker},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := assignedGapRun()
+			gs, svc, _ := assignedGapSetup(r)
+			gs.capable = 0
+			gs.peers, gs.peersErr = tc.peers, tc.err
+			if got := assignedGapReason(t, gs, svc, r); got != tc.want {
+				t.Fatalf("reason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// Non-gap run is unchanged.
+	r := assignedGapRun()
+	r.WorkerID = pgtype.UUID{}
+	gs, svc, _ := assignedGapSetup(r)
+	gs.capable = 0
+	if got := assignedGapReason(t, gs, svc, r); got != reasonNoRepoAgentSourceCapableWorker {
+		t.Fatalf("non-gap reason = %q", got)
+	}
+}
+
+func TestHealthAssignedRepoAgentSourceYoungHeldVariantsVisible(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		peers  peerRow
+		suffix string
+	}{
+		{"accepting", peersBusy, gapHeldOther},
+		{"not accepting", peersNotAcc, gapTailNotAcc},
+		{"none", peersNone, gapTailNone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := assignedGapRun()
+			r.StatusSince = ago(time.Minute)
+			r.OwnerHoldPinnable = true
+			r.StaleRequeueWorkerName = "w-old"
+			r.UpdatedAt = ago(30 * time.Minute)
+			gs, svc, _ := assignedGapSetup(r)
+			svc.p.WorkerAffinityCeiling = time.Hour
+			gs.peers = tc.peers
+			th := healthThresholds{queued: 10 * time.Minute}
+			health, got := svc.healthTargetFor(context.Background(), t0, r, th)
+			want := "waiting until 2026-07-12T12:30:00Z for its previous worker w-old" + gapHeldPrefix + tc.suffix
+			if health != healthWaitingWorker || got != want {
+				t.Fatalf("healthTargetFor = (%q, %q), want (%q, %q)", health, got, healthWaitingWorker, want)
+			}
+		})
 	}
 }

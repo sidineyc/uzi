@@ -1393,9 +1393,27 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		}
 		return gapWorker, gapOK
 	}
+	// Issue #4044: display-only peer availability, read at most once per call and only
+	// when a gap reason is actually rendered.
+	var (
+		peerAvail store.GetRepoAgentSourcePeerAvailabilityRow
+		peerErr   error
+		peerDone  bool
+	)
+	peers := func(wkr store.Worker) (store.GetRepoAgentSourcePeerAvailabilityRow, error) {
+		if !peerDone {
+			peerDone = true
+			peerAvail, peerErr = s.repoAgentSourcePeerAvailability(ctx, now, r, wkr)
+		}
+		return peerAvail, peerErr
+	}
+	heldGap := func(until time.Time, wkr store.Worker) string {
+		p, err := peers(wkr)
+		return assignedRepoAgentSourceGapHeldReason(until, wkr.Name, repoAgentSourceGapHeldTail(p, err))
+	}
 	holdReason := func(until time.Time) string {
 		if wkr, ok := gap(); ok {
-			return assignedRepoAgentSourceGapHeldReason(until, wkr.Name)
+			return heldGap(until, wkr)
 		}
 		return ownerHoldReason(until, r.StaleRequeueWorkerName)
 	}
@@ -1511,6 +1529,13 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if err != nil {
 				slog.Error("health: count repo agent source capable workers", "run_id", r.ID, "error", err)
 			} else if n == 0 {
+				// Issue #4044: a run whose assigned worker lacks the capability names that
+				// worker; when the peer read is unusable the generic fleet reason stands.
+				if wkr, ok := gap(); ok {
+					if p, perr := peers(wkr); perr == nil && p.CapableAccepting == 0 {
+						return assignedRepoAgentSourceGapReason(wkr.Name, repoAgentSourceGapPostHoldTail(p, perr))
+					}
+				}
 				return reasonNoRepoAgentSourceCapableWorker
 			}
 		}
@@ -1817,14 +1842,11 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 		if r.StaleRequeueWorkerName != "" && r.UpdatedAt.Valid &&
 			wkr.LastHeartbeatAt.Valid && !wkr.LastHeartbeatAt.Time.Before(now.Add(-s.p.WorkerHeartbeatStale)) {
 			if ceilingEnd := r.UpdatedAt.Time.Add(s.p.WorkerAffinityCeiling); !now.After(ceilingEnd) {
-				return assignedRepoAgentSourceGapHeldReason(ceilingEnd, wkr.Name)
+				return heldGap(ceilingEnd, wkr)
 			}
 		}
-		tail := "waiting for another worker to pick it up"
-		if eligibilityErr == nil && eligibility.Claimable == 0 {
-			tail = "no other worker can claim it right now"
-		}
-		return assignedRepoAgentSourceGapReason(wkr.Name, tail)
+		p, perr := peers(wkr)
+		return assignedRepoAgentSourceGapReason(wkr.Name, repoAgentSourceGapPostHoldTail(p, perr))
 	}
 	free, err := s.q.CountOnlineWorkersWithFreeSlotForUser(ctx, r.UserID)
 	if err != nil {
@@ -2206,15 +2228,70 @@ func (s *Service) assignedRepoAgentSourceGap(ctx context.Context, r store.ListAc
 	return wkr, true
 }
 
+const (
+	repoAgentSourceHeldTailOther   = "another worker may take it after that"
+	repoAgentSourceNotAcceptTail   = "a regular online worker reports it but is not accepting new runs (draining, cordoned or in maintenance)"
+	repoAgentSourceNoneRegularTail = "none of your regular online workers reports repo_agent_source_v1"
+)
+
+// repoAgentSourcePeerAvailability reads the display-only peer counts (issue #4044) through
+// an optional interface so fakes without the method keep compiling. ClaimRun never reads it.
+func (s *Service) repoAgentSourcePeerAvailability(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, wkr store.Worker) (store.GetRepoAgentSourcePeerAvailabilityRow, error) {
+	q, ok := s.q.(interface {
+		GetRepoAgentSourcePeerAvailability(context.Context, store.GetRepoAgentSourcePeerAvailabilityParams) (store.GetRepoAgentSourcePeerAvailabilityRow, error)
+	})
+	if !ok {
+		return store.GetRepoAgentSourcePeerAvailabilityRow{}, errors.New("peer availability query unavailable")
+	}
+	p, err := q.GetRepoAgentSourcePeerAvailability(ctx, store.GetRepoAgentSourcePeerAvailabilityParams{
+		UserID:          r.UserID,
+		ExcludeWorkerID: wkr.ID,
+		HeartbeatCutoff: pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
+	})
+	if err != nil {
+		slog.Error("health: repo agent source peer availability", "run_id", r.ID, "error", err)
+	}
+	return p, err
+}
+
+// repoAgentSourceGapPostHoldTail words the post-hold reason from the peer counts.
+func repoAgentSourceGapPostHoldTail(p store.GetRepoAgentSourcePeerAvailabilityRow, err error) string {
+	switch {
+	case err != nil:
+		return "waiting for another worker to pick it up"
+	case p.CapableAcceptingFree > 0:
+		return "a regular capable worker has a free slot; waiting for it to pick this run up"
+	case p.CapableAccepting > 0:
+		return "your regular capable workers are busy; waiting for a free slot"
+	case p.CapableOnline > 0:
+		return repoAgentSourceNotAcceptTail
+	default:
+		return repoAgentSourceNoneRegularTail
+	}
+}
+
+// repoAgentSourceGapHeldTail is the held-variant suffix; isStaleRequeuePinReason matches
+// exactly these three.
+func repoAgentSourceGapHeldTail(p store.GetRepoAgentSourcePeerAvailabilityRow, err error) string {
+	switch {
+	case err != nil, p.CapableAccepting > 0:
+		return repoAgentSourceHeldTailOther
+	case p.CapableOnline > 0:
+		return repoAgentSourceNotAcceptTail
+	default:
+		return repoAgentSourceNoneRegularTail
+	}
+}
+
 // assignedRepoAgentSourceGapHeldReason keeps the owner-hold lifecycle ("waiting until ...")
 // while naming the capability gap.
-func assignedRepoAgentSourceGapHeldReason(until time.Time, workerName string) string {
+func assignedRepoAgentSourceGapHeldReason(until time.Time, workerName, tail string) string {
 	who := "its previous worker"
 	if workerName != "" {
 		who += " " + workerName
 	}
 	return reasonStaleRequeuePinPrefix + until.UTC().Format(time.RFC3339) + " for " + who + ": it " +
-		repoAgentSourceGapFragment + repoAgentSourceGapResume + "; another worker may take it after that"
+		repoAgentSourceGapFragment + repoAgentSourceGapResume + "; " + tail
 }
 
 func assignedRepoAgentSourceGapReason(workerName, tail string) string {
@@ -2276,7 +2353,7 @@ func isStaleRequeuePinReason(reason string) bool {
 	return strings.HasPrefix(reason, reasonStaleRequeuePinPrefix) &&
 		strings.Contains(reason, " for its previous worker") &&
 		(strings.HasSuffix(reason, " to return; another worker may take it after that") ||
-			strings.HasSuffix(reason, repoAgentSourceGapResume+"; another worker may take it after that") ||
+			isRepoAgentSourceGapHeldSuffix(reason) ||
 			strings.HasSuffix(reason, " to finish draining or maintenance; another worker may take it after that"))
 }
 
@@ -2359,4 +2436,13 @@ func toolResultID(payload []byte) string {
 
 func activeAccountCooldown(now time.Time, r store.ListActiveRunsForHealthRow) bool {
 	return r.AccountCooldownClass.Valid && (r.AccountCooldownClass.String == "rate_limit" || r.AccountCooldownClass.String == "overload") && r.AccountCooldownEligibleAt.Valid && r.AccountCooldownEligibleAt.InfinityModifier == pgtype.Finite && r.AccountCooldownEligibleAt.Time.After(now)
+}
+
+func isRepoAgentSourceGapHeldSuffix(reason string) bool {
+	if !strings.Contains(reason, repoAgentSourceGapResume+"; ") {
+		return false
+	}
+	return strings.HasSuffix(reason, "; "+repoAgentSourceHeldTailOther) ||
+		strings.HasSuffix(reason, "; "+repoAgentSourceNotAcceptTail) ||
+		strings.HasSuffix(reason, "; "+repoAgentSourceNoneRegularTail)
 }
